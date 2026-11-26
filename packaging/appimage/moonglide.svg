@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Moonglide">
+  <title>Moonglide</title>
+  <defs>
+    <path id="cr" d="M116.9 64.18A64 64 0 1 0 167.72 159.48A54 54 0 0 1 116.9 64.18Z"/>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="#0B1417"/>
+  <g transform="translate(128 128) scale(1.15) translate(-128 -128) translate(8 0)">
+    <use href="#cr" xlink:href="#cr" transform="translate(-6 0)" fill="#5FD0C4"/>
+    <use href="#cr" xlink:href="#cr" transform="translate(12 0)" fill="#5FD0C4" stroke="#0B1417" stroke-width="10" stroke-linejoin="round" paint-order="stroke"/>
+    <use href="#cr" xlink:href="#cr" transform="translate(30 0)" fill="#EDE6D3" stroke="#0B1417" stroke-width="10" stroke-linejoin="round" paint-order="stroke"/>
+  </g>
+</svg>

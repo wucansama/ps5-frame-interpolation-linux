@@ -1,0 +1,87 @@
+name: AppImage
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # attach the AppImage to the release
+
+env:
+  GLSLANG_VERSION: 16.6.0
+  TAP_REPO: lrfsh/moonglide-chiaki-tap   # the AGPL tap, a separate repository
+
+jobs:
+  appimage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout the tap (separate AGPL repo)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TAP_REPO }}
+          path: moonglide-chiaki-tap
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkg-config g++ curl unzip file git python3 \
+            libx11-dev libjpeg-dev libavcodec-dev libavutil-dev \
+            libevent-dev libsdl2-dev libssl-dev libopus-dev libprotobuf-dev \
+            libcurl4-openssl-dev libpulse-dev python3-protobuf desktop-file-utils nasm yasm
+
+      # glslang >= 16 is not in any distro repo: use KhronosGroup's release binary.
+      - name: glslang >= 16
+        run: |
+          mkdir -p "$RUNNER_TEMP/glslang"
+          curl -fsSL -o "$RUNNER_TEMP/glslang.zip" \
+            "https://github.com/KhronosGroup/glslang/releases/download/${GLSLANG_VERSION}/glslang-${GLSLANG_VERSION}-linux-x86_64-release.zip"
+          unzip -q "$RUNNER_TEMP/glslang.zip" -d "$RUNNER_TEMP/glslang"
+          echo "GLSLANG=$RUNNER_TEMP/glslang/bin/glslang" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/glslang/bin/glslang" --version | head -2
+
+      # RIFE frame generation is compiled in only when the TensorRT 10 and CUDA headers are found. They are
+      # needed at build time only (libnvinfer / libcuda are dlopen()ed on the user's machine, nothing NVIDIA is
+      # bundled): TensorRT's open-source headers (Apache-2.0) and the CUDA headers from NVIDIA's pip wheels.
+      - name: TensorRT and CUDA headers (build time only)
+        run: |
+          h="$RUNNER_TEMP/rife-headers"; mkdir -p "$h/trt" "$h/cuda" "$h/whl"
+          for f in NvInfer NvInferImpl NvInferLegacyDims NvInferPlugin NvInferPluginBase NvInferPluginUtils \
+                   NvInferRuntime NvInferRuntimeBase NvInferRuntimeCommon NvInferRuntimePlugin NvInferVersion; do
+            curl -fsSL -o "$h/trt/$f.h" "https://raw.githubusercontent.com/NVIDIA/TensorRT/v10.9.0/include/$f.h"
+          done
+          curl -fsSL -o "$h/trt/NvOnnxParser.h" "https://raw.githubusercontent.com/onnx/onnx-tensorrt/release/10.9-GA/NvOnnxParser.h"
+          python3 -m pip download --no-deps -q -d "$h/whl" nvidia-cuda-runtime-cu12==12.8.90 nvidia-cuda-nvcc-cu12==12.8.93
+          for w in "$h"/whl/*.whl; do unzip -qo "$w" 'nvidia/*/include/*' -d "$h/cuda"; done
+          mkdir -p "$h/cuda-include"; cp -r "$h"/cuda/nvidia/*/include/. "$h/cuda-include/"
+          echo "CMAKE_EXTRA=-DMOONGLIDE_TRT_INCLUDE=$h/trt -DNVVFX_CUDA_INCLUDE=$h/cuda-include" >> "$GITHUB_ENV"
+
+      - name: Build the tap
+        run: |
+          # build.sh also fetches chiaki-ng (pinned tag) and protoc; the -dev packages are already installed.
+          MOONGLIDE_TAP_CACHE="$RUNNER_TEMP/tap-cache" MOONGLIDE_TAP_DEST="$RUNNER_TEMP/tap-bin" \
+            ./moonglide-chiaki-tap/build.sh
+          echo "TAP=$RUNNER_TEMP/tap-bin/moonglide-chiaki-tap" >> "$GITHUB_ENV"
+
+      - name: Build the AppImage
+        run: |
+          WORK="$RUNNER_TEMP/appimage-work" OUT="$PWD" ./packaging/appimage/build.sh
+          # Smoke test without a GPU: the tap starts and the AppImage unpacks.
+          ./MoonGlide-x86_64.AppImage --appimage-extract >/dev/null
+          ./squashfs-root/usr/bin/moonglide-chiaki-tap --help | head -3
+          rm -rf squashfs-root
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MoonGlide-x86_64.AppImage
+          path: MoonGlide-x86_64.AppImage
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: MoonGlide-x86_64.AppImage

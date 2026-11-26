@@ -1,0 +1,139 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// The last pass before the swapchain: upscale the processed frame into the display rect
+// (Catmull-Rom here; FSR1 EASU+RCAS when that stage is on and has written `fsr` already),
+// mix with the original by intensity, optional A/B split, the overlay badge, and the swizzle
+// to the swapchain's byte order. Output is a packed buffer copied into the swapchain image.
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "common.glsl"
+
+layout(push_constant) uniform Push {
+  uint srcW, srcH;        // processed / original frame size
+  uint dstW, dstH;        // swapchain
+  uint rectX, rectY, rectW, rectH;   // where the picture goes (letterbox)
+  float mixAmount;        // 1 = processed only, 0 = original only
+  uint flags;             // 1 overlay, 2 bgra, 4 split A/B, 8 src is display-res (fsr), 16 orig==src,
+                          // 32 outline HUD zones, 64 colour-correct the processed picture
+  uint scale;             // overlay pixel size
+  uint textCols;          // widest line
+  uint textLines;
+  float splitX;           // split position, 0..1 of the rect
+  uint overlayPos;         // 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right
+  uint pad1;
+  vec4 fix[3];            // flags & 64: affine colour correction of the processed picture
+} pc;
+
+layout(std430, binding = 0) readonly buffer Proc { uint proc[]; };     // processed (srcW x srcH, or rect if FSR)
+layout(std430, binding = 1) readonly buffer Orig { uint orig[]; };     // original (srcW x srcH)
+layout(std430, binding = 2) readonly buffer Font { uint font[]; };
+layout(std430, binding = 3) readonly buffer Text { uint text[]; };
+layout(std430, binding = 4) writeonly buffer Out { uint outPixels[]; };
+// HUD / minimap zones, in 0..1 of the picture: shown as the original (no NR, no sharpening).
+// zone[2i] = (kind 0 rect / 1 ellipse, feather in picture pixels, -, -),
+// zone[2i+1] = rect (x, y, w, h) or ellipse (cx, cy, rx, ry).
+layout(std430, binding = 5) readonly buffer Zones { uint zoneCount; uint zonePad[3]; vec4 zone[]; };
+
+// Signed distance (rect pixels, < 0 inside) to zone i.
+float zoneDistance(uint i, vec2 p) {
+  vec4 g = zone[2u * i + 1u] * vec4(pc.rectW, pc.rectH, pc.rectW, pc.rectH);
+  if (zone[2u * i].x < 0.5) {
+    vec2 d = abs(p - (g.xy + g.zw * 0.5)) - g.zw * 0.5;
+    return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
+  }
+  vec2 r = max(g.zw, vec2(1.0));
+  return (length((p - g.xy) / r) - 1.0) * min(r.x, r.y);
+}
+
+vec4 fetchProc(ivec2 p) {
+  p = clamp(p, ivec2(0), ivec2(pc.srcW - 1u, pc.srcH - 1u));
+  return unpackPixel(proc[uint(p.y) * pc.srcW + uint(p.x)]);
+}
+vec4 fetchOrig(ivec2 p) {
+  p = clamp(p, ivec2(0), ivec2(pc.srcW - 1u, pc.srcH - 1u));
+  return unpackPixel(orig[uint(p.y) * pc.srcW + uint(p.x)]);
+}
+
+vec3 colourFix(vec3 c) {
+  if ((pc.flags & 64u) == 0u) return c;
+  vec4 h = vec4(c, 1.0);
+  return vec3(dot(pc.fix[0], h), dot(pc.fix[1], h), dot(pc.fix[2], h));
+}
+
+vec4 bicubic(vec2 pos, bool useOrig) {
+  vec2 base = floor(pos);
+  vec2 f = pos - base;
+  vec4 wx = catmullRom(f.x), wy = catmullRom(f.y);
+  ivec2 b = ivec2(base) - 1;
+  vec4 acc = vec4(0.0);
+  for (int j = 0; j < 4; ++j) {
+    vec4 row;
+    if (useOrig)
+      row = fetchOrig(b + ivec2(0, j)) * wx.x + fetchOrig(b + ivec2(1, j)) * wx.y + fetchOrig(b + ivec2(2, j)) * wx.z +
+            fetchOrig(b + ivec2(3, j)) * wx.w;
+    else
+      row = fetchProc(b + ivec2(0, j)) * wx.x + fetchProc(b + ivec2(1, j)) * wx.y + fetchProc(b + ivec2(2, j)) * wx.z +
+            fetchProc(b + ivec2(3, j)) * wx.w;
+    acc += row * wy[j];
+  }
+  return acc;
+}
+
+void main() {
+  uvec2 id = gl_GlobalInvocationID.xy;
+  if (id.x >= pc.dstW || id.y >= pc.dstH) return;
+  vec3 color = vec3(0.0);
+
+  ivec2 local = ivec2(id) - ivec2(pc.rectX, pc.rectY);
+  if (local.x >= 0 && local.y >= 0 && local.x < int(pc.rectW) && local.y < int(pc.rectH)) {
+    vec2 pos = (vec2(local) + 0.5) * vec2(pc.srcW, pc.srcH) / vec2(pc.rectW, pc.rectH) - 0.5;
+    bool showOrig = (pc.flags & 4u) != 0u && float(local.x) < pc.splitX * float(pc.rectW);
+    vec3 original = bicubic(pos, true).rgb;
+    vec3 processed;
+    if ((pc.flags & 8u) != 0u) {
+      // FSR already upscaled the mixed picture to the rect.
+      color = showOrig ? original : colourFix(unpackPixel(proc[uint(local.y) * pc.rectW + uint(local.x)]).rgb);
+    } else {
+      processed = (pc.flags & 16u) != 0u ? original : colourFix(bicubic(pos, false).rgb);
+      color = showOrig ? original : mix(original, processed, pc.mixAmount);
+    }
+    if (!showOrig && zoneCount > 0u) {
+      vec2 p = vec2(local) + 0.5;
+      float keep = 0.0;   // 1 = original
+      bool edge = false;
+      for (uint i = 0u; i < min(zoneCount, 16u); ++i) {
+        float d = zoneDistance(i, p);
+        keep = max(keep, clamp(0.5 - d / max(zone[2u * i].y, 0.5), 0.0, 1.0));
+        edge = edge || abs(d) < 1.5;
+      }
+      color = mix(color, original, keep);
+      if ((pc.flags & 32u) != 0u && edge) color = vec3(1.0, 0.2, 1.0);
+    }
+    if ((pc.flags & 4u) != 0u && abs(float(local.x) - pc.splitX * float(pc.rectW)) < 1.5) color = vec3(1.0);
+  }
+
+  if ((pc.flags & 1u) != 0u && pc.textLines > 0u) {
+    const int cellW = 6, cellH = 10, margin = 2;
+    ivec2 boxSize = ivec2(int(pc.textCols) * cellW + 2 * margin, int(pc.textLines) * cellH + 2 * margin);
+    ivec2 boxPx = boxSize * int(pc.scale);
+    ivec2 origin = ivec2((pc.overlayPos & 1u) != 0u ? int(pc.dstW) - 24 - boxPx.x : 24,
+                         (pc.overlayPos & 2u) != 0u ? int(pc.dstH) - 24 - boxPx.y : 24);
+    ivec2 q = (ivec2(id) - origin) / int(pc.scale);
+    if (ivec2(id).x >= origin.x && ivec2(id).y >= origin.y && q.x < boxSize.x && q.y < boxSize.y) {
+      color = mix(color, vec3(0.0), 0.6);
+      ivec2 t = q - ivec2(margin);
+      if (t.x >= 0 && t.y >= 0) {
+        int col = t.x / cellW, line = t.y / cellH;
+        int gx = t.x % cellW, gy = t.y % cellH;
+        if (col < int(pc.textCols) && line < int(pc.textLines) && gx < 5 && gy < 7) {
+          uint ch = text[uint(line) * 64u + uint(col)] & 127u;
+          uint bits = font[ch * 8u + uint(gy)];
+          if (((bits >> uint(4 - gx)) & 1u) != 0u) color = vec3(1.0, 1.0, 0.85);
+        }
+      }
+    }
+  }
+
+  vec4 c = vec4(clamp(color, 0.0, 1.0), 1.0);
+  if ((pc.flags & 2u) != 0u) c = c.bgra;
+  outPixels[id.y * pc.dstW + id.x] = packPixel(c);
+}

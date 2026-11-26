@@ -1,0 +1,66 @@
+#version 460
+// RGBA8 in, RGBA8 out, resized — the one dispatch the work-scale path needs.
+//
+// The worker is handed the client's frame at the display size and runs the network at the
+// work size (`--work-scale`, minimal/loop.py's work_size), so the colour has to come down
+// once on the way in and the published image has to go back up once on the way out. Both
+// directions are the same dispatch with the two sizes swapped, which is why this is one
+// shader and not two: inWidth/outWidth say which way it is going, and a 1:1 call is the
+// identity to the byte (the texel-centre mapping below lands exactly on the source pixel).
+//
+// Bilinear, and deliberately so: what the stage replaces is the capture chain's
+// `videoscale`, which is a bilinear-ish resample as well, and the picture the network
+// produces is already the trade this mode exists to make (a settings-shaped one — the
+// product accepts quality costs when they can be switched off). Nearest on the way up
+// would be visibly blockier than what gst was doing, so bilinear is the comparison that
+// keeps the frame-time reading meaningful.
+//
+// The alpha byte rides through the same mix: every source this path sees is opaque (the
+// composite writes 255), so a mix of opaques is 255 again and no pixel can go transparent.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(push_constant) uniform Push {
+  uint inWidth;
+  uint inHeight;
+  uint outWidth;
+  uint outHeight;
+} pc;
+
+layout(std430, binding = 0) readonly buffer Source { uint sourcePixels[]; };   // RGBA8, little-endian
+layout(std430, binding = 6) writeonly buffer Out { uint outPixels[]; };        // RGBA8, little-endian
+
+vec4 fetch(uint x, uint y) {
+  const uint packed = sourcePixels[y * pc.inWidth + x];
+  const float k = 1.0 / 255.0;
+  return vec4(float(packed & 0xffu) * k,
+              float((packed >> 8u) & 0xffu) * k,
+              float((packed >> 16u) & 0xffu) * k,
+              float((packed >> 24u) & 0xffu) * k);
+}
+
+void main() {
+  uvec2 id = gl_GlobalInvocationID.xy;
+  if (id.x >= pc.outWidth || id.y >= pc.outHeight) return;
+  // Texel centres. Output pixel `id` covers [id, id + 1) and its centre sits at
+  // `(id + 0.5) * in/out` in input pixel units, so the position to sample is that minus
+  // the half-pixel that takes it from a boundary to a centre. At 1:1 the two halves
+  // cancel exactly and the samples are all the source pixel itself with t == 0.
+  vec2 scale = vec2(float(pc.inWidth) / float(pc.outWidth),
+                    float(pc.inHeight) / float(pc.outHeight));
+  vec2 p = (vec2(id) + vec2(0.5)) * scale - vec2(0.5);
+  vec2 base = floor(p);
+  vec2 t = p - base;
+  // Clamped at the edge, the way the sampler's address mode would have done it: the four
+  // taps of an edge pixel are that pixel repeated, so the border does not darken.
+  const ivec2 last = ivec2(int(pc.inWidth) - 1, int(pc.inHeight) - 1);
+  const ivec2 lo = clamp(ivec2(base), ivec2(0), last);
+  const ivec2 hi = clamp(ivec2(base) + 1, ivec2(0), last);
+  vec4 topLeft = fetch(uint(lo.x), uint(lo.y));
+  vec4 topRight = fetch(uint(hi.x), uint(lo.y));
+  vec4 bottomLeft = fetch(uint(lo.x), uint(hi.y));
+  vec4 bottomRight = fetch(uint(hi.x), uint(hi.y));
+  vec4 value = mix(mix(topLeft, topRight, t.x), mix(bottomLeft, bottomRight, t.x), t.y);
+  uvec4 bytes = uvec4(clamp(floor(value * 255.0 + 0.5), vec4(0.0), vec4(255.0)));
+  outPixels[id.y * pc.outWidth + id.x] =
+      bytes.r | (bytes.g << 8u) | (bytes.b << 16u) | (bytes.a << 24u);
+}

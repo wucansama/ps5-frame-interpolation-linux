@@ -1,0 +1,48 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Cheap deband (flash3kyuu-style): where four samples at a pseudo-random offset (radius up to
+// `radius` px) all agree with the pixel within `threshold`, the pixel takes their mean, then
+// gets +-0.5 LSB of triangular dither so the smoothed gradient isn't requantised into the
+// same bands. Edges and texture fail the agreement test and pass through untouched.
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "common.glsl"
+
+layout(push_constant) uniform Push {
+  uint width, height;
+  float threshold;    // per channel, 0..1 (e.g. 2/255)
+  float radius;       // px
+  uint frame;         // varies the pattern over time
+} pc;
+layout(std430, binding = 0) readonly buffer Src { uint src[]; };
+layout(std430, binding = 1) writeonly buffer Dst { uint dst[]; };
+
+vec3 at(ivec2 p) {
+  p = clamp(p, ivec2(0), ivec2(pc.width - 1u, pc.height - 1u));
+  return unpackPixel(src[uint(p.y) * pc.width + uint(p.x)]).rgb;
+}
+uint hash(uint x) {
+  x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+  return x;
+}
+float rnd(inout uint s) { s = hash(s); return float(s & 0xffffu) * (1.0 / 65535.0); }
+
+void main() {
+  uvec2 id = gl_GlobalInvocationID.xy;
+  if (id.x >= pc.width || id.y >= pc.height) return;
+  ivec2 p = ivec2(id);
+  vec3 self = at(p);
+  uint s = hash(id.x * 1973u + id.y * 9277u + pc.frame * 26699u);
+  float r = 1.0 + rnd(s) * (pc.radius - 1.0);
+  float a = rnd(s) * 6.2831853;
+  ivec2 o1 = ivec2(round(vec2(cos(a), sin(a)) * r));
+  ivec2 o2 = ivec2(-o1.y, o1.x);
+  vec3 c0 = at(p + o1), c1 = at(p - o1), c2 = at(p + o2), c3 = at(p - o2);
+  vec3 m = 0.25 * (c0 + c1 + c2 + c3);
+  vec3 d = max(max(abs(c0 - self), abs(c1 - self)), max(abs(c2 - self), abs(c3 - self)));
+  vec3 outc = self;
+  if (max(d.r, max(d.g, d.b)) < pc.threshold) {
+    float dither = (rnd(s) + rnd(s) - 1.0) * (0.5 / 255.0);
+    outc = m + dither;
+  }
+  dst[id.y * pc.width + id.x] = packPixel(vec4(outc, 1.0));
+}

@@ -1,0 +1,64 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Flow-compensated recursive temporal denoise, before NR: the previous clean frame warped by
+// the optical-flow field (2 x f16 per pixel, cur -> prev) is blended into the current one.
+// The warped value is clamped to the current 3x3 neighbourhood (a little wider than its noise),
+// so a wrong vector can only pull a pixel within what its neighbours already show; and the
+// blend fades out where warp and neighbourhood mean disagree (disocclusion, flow failure).
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "common.glsl"
+
+layout(push_constant) uniform Push {
+  uint width, height;
+  float strength;     // max weight of history (0.5 ~ averaging ~3 frames)
+  uint flags;         // 1: debug, show confidence as green
+} pc;
+layout(std430, binding = 0) readonly buffer Cur { uint curPx[]; };
+layout(std430, binding = 1) readonly buffer Prev { uint prevPx[]; };
+layout(std430, binding = 2) readonly buffer Motion { uint motion[]; };
+layout(std430, binding = 3) writeonly buffer Dst { uint dst[]; };
+
+vec3 cur(ivec2 p) {
+  p = clamp(p, ivec2(0), ivec2(pc.width - 1u, pc.height - 1u));
+  return unpackPixel(curPx[uint(p.y) * pc.width + uint(p.x)]).rgb;
+}
+vec3 prevTexel(ivec2 p) {
+  p = clamp(p, ivec2(0), ivec2(pc.width - 1u, pc.height - 1u));
+  return unpackPixel(prevPx[uint(p.y) * pc.width + uint(p.x)]).rgb;
+}
+vec3 prevBilinear(vec2 pos) {
+  pos -= 0.5;
+  vec2 b = floor(pos);
+  vec2 f = pos - b;
+  ivec2 i = ivec2(b);
+  return mix(mix(prevTexel(i), prevTexel(i + ivec2(1, 0)), f.x), mix(prevTexel(i + ivec2(0, 1)), prevTexel(i + ivec2(1, 1)), f.x), f.y);
+}
+
+void main() {
+  uvec2 id = gl_GlobalInvocationID.xy;
+  if (id.x >= pc.width || id.y >= pc.height) return;
+  ivec2 p = ivec2(id);
+  vec3 c = cur(p);
+  vec3 mn = c, mx = c, sum = c, sum2 = c * c;
+  for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) {
+      if (dx == 0 && dy == 0) continue;
+      vec3 n = cur(p + ivec2(dx, dy));
+      mn = min(mn, n); mx = max(mx, n); sum += n; sum2 += n * n;
+    }
+  vec3 mean = sum / 9.0;
+  vec3 sigma = sqrt(max(sum2 / 9.0 - mean * mean, vec3(0.0)));
+  vec2 m = unpackHalf2x16(motion[id.y * pc.width + id.x]);
+  vec3 h = prevBilinear(vec2(p) + 0.5 + m);
+  // Confidence: the history agrees with the local picture within its own spread (+ a floor
+  // for flat areas, where sigma is just the card's noise).
+  float dist = length((h - mean) / (sigma + 0.02));
+  float conf = 1.0 - smoothstep(1.0, 3.0, dist);
+  vec3 hc = clamp(h, mn - 0.01, mx + 0.01);
+  // Fast motion: resampling the history at sub-pixel offsets softens texture frame after
+  // frame, and noise is invisible at that speed anyway, so fade the history out with speed.
+  float still = 1.0 - smoothstep(2.0, 12.0, length(m));
+  vec3 o = mix(c, hc, pc.strength * conf * still);
+  if ((pc.flags & 1u) != 0u) o = mix(o, vec3(0.0, 1.0, 0.0), 0.5 * conf);
+  dst[id.y * pc.width + id.x] = packPixel(vec4(o, 1.0));
+}

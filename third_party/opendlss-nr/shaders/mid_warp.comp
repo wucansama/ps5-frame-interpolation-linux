@@ -1,0 +1,146 @@
+#version 460
+// The generated mid-frame: the previous published frame, carried along the client's own
+// motion field by a fraction of a frame - src/serve.cpp passes 0.5, which is the frame
+// between the one that was published last and the one being served now.
+//
+//   mid(pixel) = historySample(pixel + 0.5 + 0.5 * motion)
+//
+// where `history` is the same surface the composite reads for the real frame (the frame
+// this one published last, expanded by proxy_expand.comp) and `historySample` is the
+// demo's five-tap reconstruction, spelled out in composite_serve.comp. The arithmetic is
+// deliberately the composite's own: the mid-frame's only claim is that it is the history
+// the composite already warps, at half the offset, so the picture a person sees between
+// two real frames is the same reconstruction in the same units.
+//
+// What this cannot do, and does not pretend to: the client's field is 320x180 upscaled,
+// which is fine for knowing roughly where history came from and visibly coarse for
+// placing a whole frame by the vector (docs/interpolation.md, "the field is too coarse
+// for warping"). Small fast objects smear. The field also carries no "is there a history
+// at that previous position" flag, so the one case this can read is a position that
+// leaves the valid rectangle - and there it publishes the pixel itself, which degrades to
+// no interpolation at that pixel rather than to a streak. Occlusion and disocclusion are
+// the client's product question, not this shader's.
+//
+// It writes RGBA8, the same publication arithmetic as the composite (truncate to the half
+// grid, then the byte rounding), so a mid-frame and a real frame are the same kind of
+// object on the wire and the client needs no special case for the bytes.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(push_constant) uniform Push {
+  uint proxyWidth;   // the history proxy's stride: both surfaces are at the valid size
+  uint validWidth;
+  uint validHeight;
+  uint pad0;
+  float midOffset;   // 0.5: half the frame's motion, i.e. the frame between this one and the last
+} pc;
+
+// The previous published frame, through the same proxy transform (binding 1 is the
+// composite's history binding, and this is the same buffer).
+layout(std430, binding = 1) readonly buffer History { vec4 history[]; };
+// The client's motion field: 2 x f16 per pixel, current -> previous, work-resolution
+// pixels, y down. Always bound; a caller that declared no field sends none, so this
+// reads zeros and the mid-frame is the published frame itself - no interpolation, and no
+// branch to get there.
+layout(std430, binding = 2) readonly buffer Motion { uint motionField[]; };
+layout(std430, binding = 7) writeonly buffer Out { uint pixels[]; };   // RGBA8, little-endian
+
+float truncateHalf(float value) {
+  uint bits = floatBitsToUint(value);
+  uint signBit = (bits >> 16u) & 0x8000u;
+  uint exponent = (bits >> 23u) & 0xffu;
+  uint mantissa = bits & 0x7fffffu;
+  uint halfBits;
+  if (exponent == 0xffu) halfBits = signBit | (mantissa != 0u ? 0x7e00u : 0x7c00u);
+  else {
+    int halfExponent = int(exponent) - 112;
+    if (halfExponent >= 31) halfBits = signBit | 0x7c00u;
+    else if (halfExponent <= 0)
+      halfBits = halfExponent < -10 ? signBit
+                                    : signBit | ((mantissa | 0x800000u) >> uint(14 - halfExponent));
+    else halfBits = signBit | (uint(halfExponent) << 10u) | (mantissa >> 13u);
+  }
+  return unpackHalf2x16(halfBits).x;
+}
+
+uint toByte(float value) {
+  return uint(clamp(floor(value * 255.0 + 0.5), 0.0, 255.0));
+}
+
+// One bilinear fetch of the history at `p`, a position in "pixel + 0.5" units. The history
+// is a buffer and not a sampled image, so this is the bilinear a texture unit would do,
+// with the same clamp to the valid rectangle. Identical to composite_serve.comp's; the two
+// have to agree, and check_composite.py transliterates the composite's copy.
+vec3 historyFetch(vec2 p) {
+  vec2 base = floor(p - 0.5);
+  vec2 t = (p - 0.5) - base;
+  ivec2 last = ivec2(int(pc.validWidth), int(pc.validHeight)) - 1;
+  ivec2 lo = clamp(ivec2(base), ivec2(0), last);
+  ivec2 hi = clamp(ivec2(base) + 1, ivec2(0), last);
+  vec3 topLeft = history[lo.y * pc.proxyWidth + lo.x].rgb;
+  vec3 topRight = history[lo.y * pc.proxyWidth + hi.x].rgb;
+  vec3 bottomLeft = history[hi.y * pc.proxyWidth + lo.x].rgb;
+  vec3 bottomRight = history[hi.y * pc.proxyWidth + hi.x].rgb;
+  return mix(mix(topLeft, topRight, t.x), mix(bottomLeft, bottomRight, t.x), t.y);
+}
+
+// The demo's five-tap Catmull-Rom reconstruction, at the composite's own spelling: the
+// four axis taps and the centre combined with the bilinear-weight trick, normalized by
+// the weight sum. The history is fed back into the network as well as shown, so a
+// bilinear fetch here would soften the picture frame over frame (the demo's own reason for
+// five taps), and the mid-frame has to be the same reconstruction or the two frames a
+// person sees a refresh apart would differ by the filter.
+vec3 historySample(vec2 position) {
+  vec2 valid = vec2(pc.validWidth, pc.validHeight);
+  vec2 base = floor(position - 0.5) + 0.5;
+  vec2 f = clamp(position - base, vec2(0.0), vec2(1.0));
+  vec2 square = f * f;
+  vec2 cube = f * square;
+  vec2 w0 = fma(f + cube, vec2(-0.5), square);
+  vec2 w1 = (cube * 1.5 - square * 2.5) + 1.0;
+  vec2 w3 = (cube - square) * 0.5;
+  vec2 w2 = ((1.0 - w0) - w1) - w3;
+  vec2 middle = w1 + w2;
+  vec2 low = clamp(base - 1.0, vec2(0.5), valid - 0.5);
+  vec2 center = clamp(base + w2 / middle, vec2(0.5), valid - 0.5);
+  vec2 high = clamp(base + 2.0, vec2(0.5), valid - 0.5);
+  vec3 left = historyFetch(vec2(low.x, center.y));
+  vec3 top = historyFetch(vec2(center.x, low.y));
+  vec3 mid = historyFetch(center);
+  vec3 bottom = historyFetch(vec2(center.x, high.y));
+  vec3 right = historyFetch(vec2(high.x, center.y));
+  float a = w0.x * middle.y; float b = w0.y * middle.x;
+  float c = middle.x * middle.y; float d = w3.y * middle.x; float e = w3.x * middle.y;
+  vec3 value = fma(left, vec3(a), top * b);
+  value = fma(mid, vec3(c), value);
+  value = fma(bottom, vec3(d), value);
+  value = fma(right, vec3(e), value);
+  return value * (1.0 / (e + (d + (c + (a + b)))));
+}
+
+void main() {
+  uvec2 id = gl_GlobalInvocationID.xy;
+  if (id.x >= pc.validWidth || id.y >= pc.validHeight) return;
+  uint index = id.y * pc.proxyWidth + id.x;
+  vec2 valid = vec2(pc.validWidth, pc.validHeight);
+  vec2 pixel = vec2(id);
+  // `pixel + 0.5 + motion` is where the composite reads history for this pixel; half of
+  // that motion is where it was half a frame ago.
+  vec2 position = pixel + 0.5 + pc.midOffset * unpackHalf2x16(motionField[index]);
+  vec3 value;
+  if (all(greaterThanEqual(position, vec2(0.5))) &&
+      all(lessThanEqual(position, valid - 0.5))) {
+    value = historySample(position);
+  } else {
+    // This pixel's position half a frame ago left the valid rectangle, so there is no
+    // history to carry: publish the pixel itself. That is "no interpolation here" rather
+    // than a smear along the border, and it is the same case the composite skips its
+    // blend for (its hasHistory).
+    value = historyFetch(pixel + 0.5);
+  }
+  // The publication arithmetic the composite uses, for the same reason: what leaves the
+  // device is the truncated, rounded byte the client will show.
+  value = vec3(truncateHalf(value.r), truncateHalf(value.g), truncateHalf(value.b));
+  uvec3 bytes = uvec3(toByte(value.r), toByte(value.g), toByte(value.b));
+  pixels[id.y * pc.validWidth + id.x] =
+      bytes.r | (bytes.g << 8u) | (bytes.b << 16u) | (255u << 24u);
+}

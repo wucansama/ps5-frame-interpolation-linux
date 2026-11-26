@@ -1,0 +1,43 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// RIFE input: the shown picture (RGBA8, work size) -> planar fp32 RGB at the tensor size (work
+// size rounded up to 32; the pad repeats the edge). Also sums |luma(cur) - luma(prev)| over the
+// work area for the scene-cut test in rife_unpack.
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "common.glsl"
+
+layout(push_constant) uniform Push { uint width, height, padW, padH; } pc;
+layout(std430, binding = 0) readonly buffer Cur { uint cur[]; };
+layout(std430, binding = 1) readonly buffer Prev { uint prev[]; };
+layout(std430, binding = 2) writeonly buffer Dst { float dst[]; };
+layout(std430, binding = 3) buffer Stats { uint diffSum; uint total; } stats;
+
+shared uint groupDiff;
+
+void main() {
+  uvec2 id = gl_GlobalInvocationID.xy;
+  if (gl_LocalInvocationIndex == 0u) groupDiff = 0u;
+  barrier();
+  if (id.x < pc.padW && id.y < pc.padH) {
+    uvec2 s = min(id, uvec2(pc.width - 1u, pc.height - 1u));
+    uint si = s.y * pc.width + s.x;
+    vec3 c = unpackPixel(cur[si]).rgb;
+    uint plane = pc.padW * pc.padH;
+    uint di = id.y * pc.padW + id.x;
+    dst[di] = c.r;
+    dst[plane + di] = c.g;
+    dst[2u * plane + di] = c.b;
+    if (id.x < pc.width && id.y < pc.height) {
+      vec3 p = unpackPixel(prev[si]).rgb;
+      const vec3 w = vec3(0.299, 0.587, 0.114);
+      atomicAdd(groupDiff, uint(abs(dot(c - p, w)) * 255.0 + 0.5));
+    }
+  }
+  barrier();
+  if (gl_LocalInvocationIndex == 0u) {
+    atomicAdd(stats.diffSum, groupDiff);
+    uint x0 = gl_WorkGroupID.x * 16u, y0 = gl_WorkGroupID.y * 16u;
+    uint n = (x0 < pc.width && y0 < pc.height) ? min(16u, pc.width - x0) * min(16u, pc.height - y0) : 0u;
+    atomicAdd(stats.total, n);
+  }
+}

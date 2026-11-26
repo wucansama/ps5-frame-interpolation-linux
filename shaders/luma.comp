@@ -1,0 +1,24 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// RGBA8 -> R8 luma (BT.709 weights on the code values), four pixels per invocation so each
+// output word is written whole. Rows are padded to a multiple of 4 bytes.
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "common.glsl"
+
+layout(push_constant) uniform Push { uint width, height; } pc;
+layout(std430, binding = 0) readonly buffer Src { uint src[]; };
+layout(std430, binding = 1) writeonly buffer Dst { uint dst[]; };
+
+void main() {
+  uvec2 id = gl_GlobalInvocationID.xy;
+  uint stride = (pc.width + 3u) / 4u;
+  if (id.x >= stride || id.y >= pc.height) return;
+  uint word = 0u;
+  for (uint i = 0u; i < 4u; ++i) {
+    uint x = min(id.x * 4u + i, pc.width - 1u);
+    vec3 c = unpackPixel(src[id.y * pc.width + x]).rgb;
+    uint l = uint(clamp(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0) * 255.0 + 0.5);
+    word |= l << (8u * i);
+  }
+  dst[id.y * stride + id.x] = word;
+}

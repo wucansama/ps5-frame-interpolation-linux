@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=MoonGlide
+GenericName=Game stream upscaler
+Comment=PS5 Remote Play or capture card: denoise, frame generation and upscaling on NVIDIA GPUs
+Exec=moonglide --ui
+Icon=moonglide
+Terminal=false
+Categories=Game;Video;
+Keywords=PS5;Remote Play;capture;upscale;frame generation;
+StartupWMClass=moonglide

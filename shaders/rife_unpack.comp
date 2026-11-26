@@ -1,0 +1,50 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// RIFE output (planar fp32 RGB, tensor size) -> the generated picture (RGBA8, work size). On a
+// scene cut (mean |luma change| between the two real frames above `cut`) or without a previous
+// frame, the real frame is held instead: interpolating across a cut only makes a ghost.
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "common.glsl"
+
+// static: where the two real frames agree around a pixel (3x3, luma within `still`), the output is
+// their blend, not the network's: RIFE softens / shifts static text edges a little (a static menu
+// over a moving background).
+layout(push_constant) uniform Push { uint width, height, padW, padH; float cut; uint hold; float still; float outlier; float t; } pc;
+layout(std430, binding = 0) readonly buffer Src { float src[]; };
+layout(std430, binding = 1) readonly buffer Cur { uint cur[]; };
+layout(std430, binding = 2) readonly buffer Stats { uint diffSum; uint total; } stats;
+layout(std430, binding = 3) writeonly buffer Dst { uint dst[]; };
+layout(std430, binding = 4) readonly buffer Prev { uint prev[]; };
+
+float luma(uint p) { return dot(unpackPixel(p).rgb, vec3(0.299, 0.587, 0.114)); }
+
+void main() {
+  uvec2 id = gl_GlobalInvocationID.xy;
+  if (id.x >= pc.width || id.y >= pc.height) return;
+  uint i = id.y * pc.width + id.x;
+  bool held = pc.hold != 0u ||
+              (pc.cut > 0.0 && stats.total > 0u && float(stats.diffSum) > pc.cut * 255.0 * float(stats.total));
+  if (held) { dst[i] = cur[i]; return; }
+  // One 3x3 pass over both real frames: the static test and their luma range.
+  bool still = true;
+  float lo = 1.0, hi = 0.0;
+  for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) {
+      ivec2 q = clamp(ivec2(id) + ivec2(dx, dy), ivec2(0), ivec2(pc.width - 1u, pc.height - 1u));
+      uint j = uint(q.y) * pc.width + uint(q.x);
+      float a = luma(prev[j]), b = luma(cur[j]);
+      if (abs(a - b) > pc.still) still = false;
+      lo = min(lo, min(a, b));
+      hi = max(hi, max(a, b));
+    }
+  vec4 blend = mix(unpackPixel(prev[i]), unpackPixel(cur[i]), pc.t);
+  if (pc.still > 0.0 && still) { dst[i] = packPixel(blend); return; }
+  uint plane = pc.padW * pc.padH;
+  uint si = id.y * pc.padW + id.x;
+  vec3 m = vec3(src[si], src[plane + si], src[2u * plane + si]);
+  // Outlier rejection ("fleas"): a generated pixel darker / brighter than anything around it in
+  // both real frames is a warp artefact; the time blend instead.
+  float l = dot(m, vec3(0.299, 0.587, 0.114));
+  if (pc.outlier > 0.0 && (l < lo - pc.outlier || l > hi + pc.outlier)) { dst[i] = packPixel(blend); return; }
+  dst[i] = packPixel(vec4(m, 1.0));
+}

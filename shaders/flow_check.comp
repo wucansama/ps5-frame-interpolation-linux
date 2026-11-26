@@ -1,0 +1,43 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Diagnostic: how well does the motion field explain this frame from the previous one?
+//   sums[0] += |luma(cur) - luma(prev at pixel + motion)| * 16   (bilinear)
+//   sums[1] += |luma(cur) - luma(prev at pixel)|          * 16
+// A correct current->previous field makes sums[0] clearly smaller than sums[1] under motion.
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "common.glsl"
+
+layout(push_constant) uniform Push { uint width, height; } pc;
+layout(std430, binding = 0) readonly buffer Cur { uint cur[]; };
+layout(std430, binding = 1) readonly buffer Prev { uint prev[]; };
+layout(std430, binding = 2) readonly buffer Motion { uint motion[]; };
+layout(std430, binding = 3) buffer Sums { uint sums[]; };
+
+shared uint sFlow, sZero;
+
+float lumaAt(ivec2 p) {
+  p = clamp(p, ivec2(0), ivec2(pc.width - 1u, pc.height - 1u));
+  return dot(unpackPixel(prev[uint(p.y) * pc.width + uint(p.x)]).rgb, vec3(0.2126, 0.7152, 0.0722)) * 255.0;
+}
+
+void main() {
+  if (gl_LocalInvocationIndex == 0u) { sFlow = 0u; sZero = 0u; }
+  barrier();
+  uvec2 id = gl_GlobalInvocationID.xy;
+  if (id.x < pc.width && id.y < pc.height) {
+    uint i = id.y * pc.width + id.x;
+    float c = dot(unpackPixel(cur[i]).rgb, vec3(0.2126, 0.7152, 0.0722)) * 255.0;
+    vec2 pos = vec2(id) + unpackHalf2x16(motion[i]);
+    vec2 b = floor(pos);
+    vec2 f = pos - b;
+    ivec2 q = ivec2(b);
+    float warped = mix(mix(lumaAt(q), lumaAt(q + ivec2(1, 0)), f.x), mix(lumaAt(q + ivec2(0, 1)), lumaAt(q + ivec2(1, 1)), f.x), f.y);
+    atomicAdd(sFlow, uint(abs(c - warped) * 16.0));
+    atomicAdd(sZero, uint(abs(c - lumaAt(ivec2(id))) * 16.0));
+  }
+  barrier();
+  if (gl_LocalInvocationIndex == 0u) {
+    atomicAdd(sums[0], sFlow);
+    atomicAdd(sums[1], sZero);
+  }
+}

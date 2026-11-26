@@ -1,0 +1,35 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// RGBA8 -> RGBA8 at any scale, Catmull-Rom (16 taps, clamped to the source). Used to bring
+// the capture to the NR work size when the two differ.
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "common.glsl"
+
+layout(push_constant) uniform Push {
+  uint srcW, srcH, dstW, dstH;
+} pc;
+
+layout(std430, binding = 0) readonly buffer Src { uint src[]; };
+layout(std430, binding = 1) writeonly buffer Dst { uint dst[]; };
+
+vec4 texel(ivec2 p) {
+  p = clamp(p, ivec2(0), ivec2(pc.srcW - 1u, pc.srcH - 1u));
+  return unpackPixel(src[uint(p.y) * pc.srcW + uint(p.x)]);
+}
+
+void main() {
+  uvec2 id = gl_GlobalInvocationID.xy;
+  if (id.x >= pc.dstW || id.y >= pc.dstH) return;
+  vec2 pos = (vec2(id) + 0.5) * vec2(pc.srcW, pc.srcH) / vec2(pc.dstW, pc.dstH) - 0.5;
+  vec2 base = floor(pos);
+  vec2 f = pos - base;
+  vec4 wx = catmullRom(f.x), wy = catmullRom(f.y);
+  ivec2 b = ivec2(base) - 1;
+  vec4 acc = vec4(0.0);
+  for (int j = 0; j < 4; ++j) {
+    vec4 row = texel(b + ivec2(0, j)) * wx.x + texel(b + ivec2(1, j)) * wx.y + texel(b + ivec2(2, j)) * wx.z +
+               texel(b + ivec2(3, j)) * wx.w;
+    acc += row * wy[j];
+  }
+  dst[id.y * pc.dstW + id.x] = packPixel(acc);
+}

@@ -1,0 +1,26 @@
+MoonGlide is MIT licensed (LICENSE). It is not affiliated with, endorsed by or supported by NVIDIA, AMD, Sony,
+or the authors of Lossless Scaling / lsfg-vk. "DLSS" is a trademark of NVIDIA Corporation, used only to describe
+what the bundled network implementation is compatible with. No NVIDIA software, weights or headers are included.
+
+Bundled third-party code (third_party/):
+- OpenDLSS-NR (MIT), Copyright (c) 2026 maan, with a Linux port patch: third_party/opendlss-nr
+- volk (MIT), Arseny Kapoulkine: third_party/volk
+- Vulkan-Headers (Apache-2.0 / MIT), The Khronos Group: third_party/vulkan-headers (C headers only)
+- Dear ImGui v1.91.5 (MIT), Copyright (c) 2014-2024 Omar Cornut: third_party/imgui (settings overlay)
+- FidelityFX FSR 1.0 EASU / RCAS (MIT), Copyright (c) 2021 Advanced Micro Devices, Inc.: shaders/fsr_easu.comp and
+  shaders/fsr_rcas.comp are re-expressions of AMD's algorithm.
+- RIFE v4.22-lite / v4.25-lite network definition (MIT): Practical-RIFE by hzwer, via HolyWu/vs-rife, Copyright (c) 2021
+  HolyWu: tools/rife (see tools/rife/LICENSE). The weights are downloaded by the user's own export step, not shipped.
+
+Used at runtime, not bundled: libjpeg-turbo (BSD-style / IJG), Xlib (MIT), the Vulkan loader, lsfg-vk (optional).
+- Veyra (GPL-3.0, https://github.com/Likely7/Veyra-NRVideo), the Windows app by Likely7: MoonGlide started as a Linux
+  take on its idea (capture -> neural denoise -> upscale -> frame generation). No Veyra code is included.
+- SmoovPlay's frame-tap shared-memory layout v1 (MIT, https://github.com/smoovplay/smoovplay): src/rp_tap.h is modelled on it.
+
+Separate program, not part of this repository's license: moonglide-chiaki-tap (AGPL-3.0 with the OpenSSL exception), a
+derived work of chiaki-ng's libchiaki (https://github.com/streetpea/chiaki-ng), source at
+https://github.com/lrfsh/moonglide-chiaki-tap. MoonGlide only starts it as a process and talks to it through the shared
+memory layout in src/rp_tap.h (MIT).
+
+Optional pieces the user installs, never bundled: NVIDIA TensorRT, the NVIDIA Video Effects SDK, NVIDIA's neural
+rendering weights (see docs/WEIGHTS.md) and Lossless Scaling's Lossless.dll (for lsfg-vk).

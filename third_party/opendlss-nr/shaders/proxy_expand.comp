@@ -1,0 +1,35 @@
+#version 460
+// RGBA8 in, the f32 proxy out — what preprocess.comp reads.
+//
+// The proxy used to be built on the host: 11M float writes a frame, then 14.7MB uploaded
+// for the network to read. Here the upload is the camera's own 8-bit frame (3.7MB, a
+// quarter of the bytes) and the expansion is one dispatch.
+//
+// No rounding to f16 here on purpose: preprocess.comp rounds the proxy itself
+// (`roundF16(roundF16(roundF16(rgba.r) - 0.5) * 0.125)`), so rounding it here would be the
+// same work done twice, which is what the host loop was doing.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(push_constant) uniform Push {
+  uint width;
+  uint height;
+  uint pad0;
+  uint pad1;
+} pc;
+
+layout(std430, binding = 0) readonly buffer Source { uint pixels[]; };   // RGBA8, little-endian
+layout(std430, binding = 6) writeonly buffer Proxy { vec4 proxy[]; };
+
+void main() {
+  uvec2 id = gl_GlobalInvocationID.xy;
+  if (id.x >= pc.width || id.y >= pc.height) return;
+  const uint packed = pixels[id.y * pc.width + id.x];
+  const float k = 1.0 / 255.0;
+  const uint r = pc.pad0 != 0 ? (packed / 65536u) % 256u : packed % 256u;
+  const uint g = (packed / 256u) % 256u;
+  const uint b = pc.pad0 != 0 ? packed % 256u : (packed / 65536u) % 256u;
+  proxy[id.y * pc.width + id.x] = vec4(float(r) * k,
+                                       float(g) * k,
+                                       float(b) * k,
+                                       1.0);
+}

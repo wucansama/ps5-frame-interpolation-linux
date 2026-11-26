@@ -1,0 +1,186 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Frame generation: the picture at time t between `prev` (t = 0) and `cur` (t = 1) from the
+// optical-flow field (per pixel of cur, 2 x f16 pixels, cur -> prev).
+// An object at cur pixel p was at p + m(p) in prev, so at time t it is at p + (1-t)*m(p). For
+// an output pixel q, p is found by a short fixed-point search (the flow belongs to cur's
+// pixels, not q's); then cur is fetched at q - (1-t)*m and prev at q + t*m.
+// Where the two fetches agree they are averaged by time; where they don't (occlusion, bad
+// flow) the nearer frame in time wins, so mistakes look like a held frame, not a ghost.
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "common.glsl"
+
+// flags: 1 debug tint, 2 hard pick, 4 dilate the disagreement by 2 px, 8 clamp to the source's
+// 3x3 range, 16 count pass (only counts disagreeing pixels into stats), 32 static guard,
+// 64 outlier rejection (luma outside both unwarped 3x3 neighbourhoods -> time blend at q).
+// 256 static pass-through (prev and cur agree in the 3x3 around q -> their time blend, no warp).
+// (128, the flow median, is applied in flow_upsample.)
+// hold: if more than this fraction of the picture disagrees (the flow failed on a fast move),
+// the whole generated picture is the current real one: a held frame instead of a patchwork of
+// two pictures, which reads as a semi-transparent ghost at 60 fps. 0 disables.
+layout(push_constant) uniform Push { uint width, height; float t; uint flags; float hold; } pc;
+layout(std430, binding = 0) readonly buffer Prev { uint prevPx[]; };
+layout(std430, binding = 1) readonly buffer Cur { uint curPx[]; };
+layout(std430, binding = 2) readonly buffer Motion { uint motion[]; };
+layout(std430, binding = 3) writeonly buffer Dst { uint dst[]; };
+layout(std430, binding = 4) coherent buffer Stats { uint fails; uint total; } stats;
+
+shared uint groupFails, groupTotal;
+
+vec2 motionAt(vec2 p) {
+  ivec2 i = clamp(ivec2(floor(p)), ivec2(0), ivec2(pc.width - 1u, pc.height - 1u));
+  return unpackHalf2x16(motion[uint(i.y) * pc.width + uint(i.x)]);
+}
+
+vec4 texel(bool fromPrev, ivec2 p) {
+  p = clamp(p, ivec2(0), ivec2(pc.width - 1u, pc.height - 1u));
+  uint i = uint(p.y) * pc.width + uint(p.x);
+  return unpackPixel(fromPrev ? prevPx[i] : curPx[i]);
+}
+
+vec4 bilinear(bool fromPrev, vec2 pos) {
+  pos -= 0.5;
+  vec2 b = floor(pos);
+  vec2 f = pos - b;
+  ivec2 i = ivec2(b);
+  return mix(mix(texel(fromPrev, i), texel(fromPrev, i + ivec2(1, 0)), f.x),
+             mix(texel(fromPrev, i + ivec2(0, 1)), texel(fromPrev, i + ivec2(1, 1)), f.x), f.y);
+}
+
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+// d between the two fetches for output pixel q (and the fetches themselves).
+float fetchDiff(vec2 q, float s, out vec4 c, out vec4 p, out vec2 m) {
+  m = motionAt(q);
+  for (int k = 0; k < 3; ++k) m = motionAt(q - s * m);
+  c = bilinear(false, q - s * m);
+  p = bilinear(true, q + pc.t * m);
+  return abs(luma(c.rgb) - luma(p.rgb)) + 0.5 * length(c.rgb - p.rgb);
+}
+
+// The picture doesn't change at p between prev and cur.
+bool staticAt(ivec2 p) {
+  vec4 u = texel(true, p), v = texel(false, p);
+  return abs(luma(u.rgb) - luma(v.rgb)) + 0.5 * length(u.rgb - v.rgb) < 0.05;
+}
+
+bool inside(vec2 a) { return all(greaterThanEqual(a, vec2(0.0))) && all(lessThan(a, vec2(pc.width, pc.height))); }
+
+void main() {
+  uvec2 id = gl_GlobalInvocationID.xy;
+  if ((pc.flags & 16u) != 0u) {
+    // Count pass: every 2nd pixel each way, one atomic per workgroup.
+    if (gl_LocalInvocationIndex == 0u) { groupFails = 0u; groupTotal = 0u; }
+    barrier();
+    if (id.x < pc.width && id.y < pc.height && ((id.x | id.y) & 1u) == 0u) {
+      vec4 c, p;
+      vec2 m;
+      float d = fetchDiff(vec2(id) + 0.5, 1.0 - pc.t, c, p, m);
+      atomicAdd(groupTotal, 1u);
+      if (d >= 0.06) atomicAdd(groupFails, 1u);
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u && groupTotal > 0u) {
+      atomicAdd(stats.fails, groupFails);
+      atomicAdd(stats.total, groupTotal);
+    }
+    return;
+  }
+  if (id.x >= pc.width || id.y >= pc.height) return;
+  if (pc.hold > 0.0 && stats.total > 0u && float(stats.fails) > pc.hold * float(stats.total)) {
+    dst[id.y * pc.width + id.x] = curPx[id.y * pc.width + id.x];
+    return;
+  }
+  if ((pc.flags & 256u) != 0u) {
+    // Static pass-through: where the picture doesn't change around q (prev and cur agree at
+    // all of its 3x3 unwarped), the output is their blend whatever the flow says. A warp can
+    // only add something that is in neither real frame there: the "fleas" next to a moving
+    // background behind a static menu, where the warp sources move and the static guard
+    // doesn't apply.
+    bool still = true;
+    for (int y = -1; y <= 1 && still; ++y)
+      for (int x = -1; x <= 1 && still; ++x) still = staticAt(ivec2(id) + ivec2(x, y));
+    if (still) {
+      dst[id.y * pc.width + id.x] = packPixel(mix(texel(true, ivec2(id)), texel(false, ivec2(id)), pc.t));
+      return;
+    }
+  }
+  vec2 q = vec2(id) + 0.5;
+  float s = 1.0 - pc.t;   // the distance back from cur to the output time
+  vec4 c, p;
+  vec2 m;
+  float d = fetchDiff(q, s, c, p, m);
+  // A fetch from outside the picture is edge smear: take the other frame there.
+  const bool cIn = inside(q - s * m), pIn = inside(q + pc.t * m);
+  if (cIn != pIn) {
+    vec4 o = cIn ? c : p;
+    dst[id.y * pc.width + id.x] = packPixel(o);
+    return;
+  }
+  if ((pc.flags & 4u) != 0u) {
+    vec4 c2, p2;
+    vec2 m2;
+    const vec2 ring[8] = vec2[](vec2(-2, 0), vec2(2, 0), vec2(0, -2), vec2(0, 2),
+                                vec2(-1.5, -1.5), vec2(1.5, 1.5), vec2(-1.5, 1.5), vec2(1.5, -1.5));
+    for (int k = 0; k < 8; ++k) {
+      vec2 o = ring[k];
+      d = max(d, fetchDiff(q + o, s, c2, p2, m2));
+    }
+  }
+  float agree = (pc.flags & 2u) != 0u ? (d < 0.06 ? 1.0 : 0.0) : clamp(1.0 - (d - 0.04) / 0.12, 0.0, 1.0);
+  vec4 near = pc.t >= 0.5 ? c : p;
+  vec4 o = mix(near, mix(p, c, pc.t), agree);
+  if ((pc.flags & 8u) != 0u) {
+    // Never leave the colour range of the nearer source around where it was fetched.
+    vec2 at = pc.t >= 0.5 ? q - s * m : q + pc.t * m;
+    bool fromPrev = pc.t < 0.5;
+    ivec2 b = ivec2(floor(at));
+    vec4 lo = vec4(1e9), hi = vec4(-1e9);
+    for (int y = -1; y <= 1; ++y)
+      for (int x = -1; x <= 1; ++x) {
+        vec4 v = texel(fromPrev, b + ivec2(x, y));
+        lo = min(lo, v);
+        hi = max(hi, v);
+      }
+    o = clamp(o, lo, hi);
+  }
+  if ((pc.flags & 32u) != 0u) {
+    // Static guard: where the picture doesn't change here (prev and cur agree at q itself), the
+    // output must stay inside their joint 3x3 range. A noisy flow vector next to thin
+    // high-contrast text (moving particles behind a menu) otherwise pulls single bright text
+    // pixels into the background ("fleas").
+    // Moving content (a particle passing over a static spot) is left alone: the guard only
+    // applies when the place the warp fetched from is static as well.
+    ivec2 b = ivec2(id);
+    vec4 pc0 = texel(true, b), cc0 = texel(false, b);
+    ivec2 fc = ivec2(floor(q - s * m)), fp = ivec2(floor(q + pc.t * m));
+    if (staticAt(b) && staticAt(fc) && staticAt(fp)) {
+      vec4 lo = min(pc0, cc0), hi = max(pc0, cc0);
+      for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x) {
+          if (x == 0 && y == 0) continue;
+          vec4 u = texel(true, b + ivec2(x, y)), v = texel(false, b + ivec2(x, y));
+          lo = min(lo, min(u, v));
+          hi = max(hi, max(u, v));
+        }
+      o = clamp(o, lo, hi);
+    }
+  }
+  if ((pc.flags & 64u) != 0u) {
+    // Outlier rejection: "fleas" are single bright pixels in dark areas. If the output's luma is
+    // outside the 3x3 range of both unwarped prev(q) and cur(q) (plus a margin), it came from
+    // nowhere near here in either real frame: use the plain time blend at q instead.
+    ivec2 b = ivec2(id);
+    float lo = 1e9, hi = -1e9;
+    for (int y = -1; y <= 1; ++y)
+      for (int x = -1; x <= 1; ++x) {
+        float u = luma(texel(true, b + ivec2(x, y)).rgb), v = luma(texel(false, b + ivec2(x, y)).rgb);
+        lo = min(lo, min(u, v));
+        hi = max(hi, max(u, v));
+      }
+    const float margin = 0.04, l = luma(o.rgb);
+    if (l > hi + margin || l < lo - margin) o = mix(texel(true, b), texel(false, b), pc.t);
+  }
+  if ((pc.flags & 1u) != 0u) o.rgb = mix(o.rgb, vec3(1.0, 0.0, 0.0), (1.0 - agree) * 0.6);
+  dst[id.y * pc.width + id.x] = packPixel(o);
+}

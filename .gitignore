@@ -1,0 +1,33 @@
+build/
+/model/
+*.dll
+stage*.bin
+manifest.json
+*.core
+core
+__pycache__/
+*.onnx
+*.engine
+*.pkl
+build-dev/
+# private notes and site launchers: never published
+docs/PLAN.md
+scripts/run-*.sh
+# build and packaging output
+appimage-work/
+squashfs-root/
+*.AppImage
+# test material, captures, local scratch
+*.hevc
+*.h264
+*.mkv
+*.mp4
+*.mjpeg
+*.log
+.claude/
+research/
+scratch/
+
+# local build (not part of the fork)
+build-cn/
+build-*/

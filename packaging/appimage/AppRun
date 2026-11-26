@@ -1,0 +1,11 @@
+#!/bin/sh
+# AppImage entry point. The binary finds its shaders (../share/moonglide) and the Remote Play
+# tap (moonglide-chiaki-tap, next to it) relative to its own path, so nothing else is needed here.
+#   AppRun setup-rife   installs TensorRT + the RIFE model into ~/.local/share/moonglide (see docs/INSTALL.md)
+HERE="$(dirname "$(readlink -f "$0")")"
+export PATH="$HERE/usr/bin:$PATH"
+if [ "$1" = "setup-rife" ]; then
+  shift
+  exec "$HERE/usr/share/moonglide/scripts/setup-rife.sh" "$@"
+fi
+exec "$HERE/usr/bin/moonglide" "$@"

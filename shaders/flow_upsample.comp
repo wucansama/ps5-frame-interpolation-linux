@@ -1,0 +1,51 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// 4x4-grid optical flow (R16G16 S10.5 fixed point, pixels) -> one motion vector per pixel,
+// 2 x f16 packed (x | y << 16), current -> previous, in pixels: the NR composite's field.
+// Bilinear between block centres. With `median`, each grid vector more than 1.5 px from the
+// component-wise median of its 3x3 neighbourhood is replaced by that median first.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform Push { uint width, height, gridW, gridH; float scale; uint median; } pc;
+layout(std430, binding = 0) readonly buffer Flow { uint flow[]; };
+layout(std430, binding = 1) writeonly buffer Motion { uint motion[]; };
+
+vec2 cell(ivec2 g) {
+  g = clamp(g, ivec2(0), ivec2(pc.gridW - 1u, pc.gridH - 1u));
+  uint v = flow[uint(g.y) * pc.gridW + uint(g.x)];
+  int x = int(v << 16) >> 16;   // sign-extend the low half
+  int y = int(v) >> 16;
+  return vec2(x, y) * (pc.scale / 32.0);
+}
+
+#define S2(a, b) { vec2 lo_ = min(a, b); b = max(a, b); a = lo_; }
+// Median of 9 (component-wise), the 19-exchange network.
+vec2 median9(vec2 v[9]) {
+  S2(v[1], v[2]); S2(v[4], v[5]); S2(v[7], v[8]); S2(v[0], v[1]); S2(v[3], v[4]); S2(v[6], v[7]);
+  S2(v[1], v[2]); S2(v[4], v[5]); S2(v[7], v[8]); S2(v[0], v[3]); S2(v[5], v[8]); S2(v[4], v[7]);
+  S2(v[3], v[6]); S2(v[1], v[4]); S2(v[2], v[5]); S2(v[4], v[7]); S2(v[4], v[2]); S2(v[6], v[4]);
+  S2(v[4], v[2]);
+  return v[4];
+}
+
+vec2 filtered(ivec2 g) {
+  vec2 c = cell(g);
+  if (pc.median == 0u) return c;
+  vec2 v[9];
+  for (int y = -1; y <= 1; ++y)
+    for (int x = -1; x <= 1; ++x) v[(y + 1) * 3 + x + 1] = cell(g + ivec2(x, y));
+  vec2 m = median9(v);
+  return length(c - m) > 1.5 ? m : c;
+}
+
+void main() {
+  uvec2 id = gl_GlobalInvocationID.xy;
+  if (id.x >= pc.width || id.y >= pc.height) return;
+  vec2 g = (vec2(id) + 0.5) / 4.0 - 0.5;
+  vec2 b = floor(g);
+  vec2 f = g - b;
+  ivec2 i = ivec2(b);
+  vec2 m = mix(mix(filtered(i), filtered(i + ivec2(1, 0)), f.x),
+               mix(filtered(i + ivec2(0, 1)), filtered(i + ivec2(1, 1)), f.x), f.y);
+  motion[id.y * pc.width + id.x] = packHalf2x16(m);
+}
