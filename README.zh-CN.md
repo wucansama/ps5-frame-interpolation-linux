@@ -1,4 +1,7 @@
-# MoonGlide 简体中文分支
+# Sony PlayStation 5 frame interpolation tool for Linux（简体中文分支）
+
+> 非官方项目：与 Sony Interactive Entertainment 无隶属关系；PlayStation 是 Sony 的商标。
+> 本项目是基于 MoonGlide 的本地化分支，适用于 PS5 采集卡/Remote Play。
 
 这是 [lrfsh/moonglide](https://github.com/lrfsh/moonglide) 的简体中文本地化分支
 （上游 MIT License，版权归原贡献者所有）。
