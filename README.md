@@ -48,7 +48,7 @@ ninja -C build
 
 - 翻译由机器辅助 + 关键术语人工校对；GPU/VRAM/FPS/MJPG 等技术缩写与实时数值保留英文。
 - 与上游 MoonGlide 的差异：ImGui 文本层 i18n、Noto Sans SC 字体、中文状态栏/预算文案。
-- 上游英文说明见 [README.en.md](README.en.md)。
+- 上游英文文档见 [lrfsh/moonglide](https://github.com/lrfsh/moonglide)。
 - RIFE / NVIDIA VFX 后端需要额外依赖，本分支未改动其上游行为。
 
 ## 许可证
